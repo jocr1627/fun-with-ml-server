@@ -1,13 +1,12 @@
 import { GenerateJob, JobStatus, Model, TrainingJob } from 'fun-with-ml-schema';
 import WebSocket from 'ws';
 import { MessageKey, Status } from '../backend';
+import client from '../db';
 import { Event, pubsub } from '../pubsub';
 import { Resolvers } from './resolvers';
 
 const generateJobs: { [key: string]: GenerateJob } = {};
-const models: { [key: string]: Model } = {};
 const trainingJobs: { [key: string]: TrainingJob } = {};
-let nextId = 0;
 
 export const modelResolvers: Resolvers = {
   Mutation: {
@@ -17,17 +16,10 @@ export const modelResolvers: Resolvers = {
       }
 
       const { name } = args.input;
-      const id = nextId.toString();
-      const model = {
-        id,
-        name,
-        urls: []
-      };
 
-      nextId += 1;
-      models[id] = model;
-
-      return model;
+      return client
+        .query('INSERT INTO models(name) VALUES ($1) RETURNING *', [name])
+        .then(results => results.rows[0]);
     },
     deleteModel: (_, args) => {
       if (!args) {
@@ -35,11 +27,6 @@ export const modelResolvers: Resolvers = {
       }
 
       const { id } = args.input;
-      const model = models[id];
-
-      if (!model) {
-        return null;
-      }
 
       return new Promise(resolve => {
         const socket = new WebSocket(
@@ -48,128 +35,158 @@ export const modelResolvers: Resolvers = {
 
         socket.onmessage = () => {
           socket.close();
-
-          delete models[id];
-
           resolve();
         };
 
         socket.onopen = () => {
           socket.send(
             JSON.stringify({
-              args: { model },
+              args: { id },
               key: MessageKey.Delete
             })
           );
         };
-      });
+      })
+        .then(() =>
+          client.query('DELETE FROM models WHERE id = $1 RETURNING *', [id])
+        )
+        .then(() => client.query('SELECT * from models WHERE id = $1', [id]))
+        .then(results => results.rows[0]);
     },
     generateTextFromModel: (_, args) => {
-      if (!args || !models[args.input.id]) {
+      if (!args) {
         return null;
       }
 
       const { count, id, maxLength, prefix, temperature } = args.input;
-      const generateJob = { id, status: JobStatus.PENDING, text: [] };
-      const model = models[id];
-      const text: string[] = [];
 
-      generateJobs[id] = generateJob;
+      return client
+        .query('SELECT * from models WHERE id = $1', [id])
+        .then(results => results.rows[0])
+        .then(model => {
+          if (!model) {
+            return null;
+          }
 
-      pubsub.publish(Event.TextGenerated, {
-        textGenerated: generateJob
-      });
+          const generateJob = { id, status: JobStatus.PENDING, text: [] };
+          const text: string[] = [];
 
-      const socket = new WebSocket(
-        process.env.BACKEND_ADDRESS || 'ws://localhost:8000'
-      );
+          generateJobs[id] = generateJob;
 
-      socket.onmessage = message => {
-        const response = JSON.parse(message.data as string);
-        let generateJob: GenerateJob;
+          pubsub.publish(Event.TextGenerated, {
+            textGenerated: generateJob
+          });
 
-        if (response.status == Status.Done) {
-          socket.close();
-          generateJob = { id, status: JobStatus.DONE, text };
-        } else {
-          text.push(response.results);
-          generateJob = { id, status: JobStatus.ACTIVE, text };
-        }
+          const socket = new WebSocket(
+            process.env.BACKEND_ADDRESS || 'ws://localhost:8000'
+          );
 
-        generateJobs[id] = generateJob;
+          socket.onmessage = message => {
+            const response = JSON.parse(message.data as string);
+            let generateJob: GenerateJob;
 
-        pubsub.publish(Event.TextGenerated, {
-          textGenerated: generateJob
+            if (response.status == Status.Done) {
+              socket.close();
+              generateJob = { id, status: JobStatus.DONE, text };
+            } else {
+              text.push(response.results);
+              generateJob = { id, status: JobStatus.ACTIVE, text };
+            }
+
+            generateJobs[id] = generateJob;
+
+            pubsub.publish(Event.TextGenerated, {
+              textGenerated: generateJob
+            });
+          };
+
+          socket.onopen = () => {
+            socket.send(
+              JSON.stringify({
+                args: { count, maxLength, model, prefix, temperature },
+                key: MessageKey.Generate
+              })
+            );
+          };
+
+          return generateJob;
         });
-      };
-
-      socket.onopen = () => {
-        socket.send(
-          JSON.stringify({
-            args: { count, maxLength, model, prefix, temperature },
-            key: MessageKey.Generate
-          })
-        );
-      };
-
-      return generateJob;
     },
     trainModel: (_, args) => {
-      const hasUrl =
-        args && models[args.input.id].urls.indexOf(args.input.url) >= 0;
-
-      if (!args || !models[args.input.id] || (!args.input.force && hasUrl)) {
+      if (!args) {
         return null;
       }
 
-      const { epochs, id, selectors, url } = args.input;
-      const model = models[id];
-      const trainingJob = { id, status: JobStatus.PENDING };
+      const { epochs, force, id, selectors, url } = args.input;
+      const initialTrainingJob = { id, status: JobStatus.PENDING };
 
-      trainingJobs[id] = trainingJob;
+      return client
+        .query('SELECT * from models WHERE id = $1', [id])
+        .then(results => results.rows[0])
+        .then(model => {
+          const hasUrl = model && model.urls.indexOf(args.input.url) >= 0;
 
-      pubsub.publish(Event.BatchCompleted, {
-        batchCompleted: trainingJob
-      });
+          if (!model || (!force && hasUrl)) {
+            return null;
+          }
 
-      if (!hasUrl) {
-        const newModel = { ...model, urls: model.urls.concat(url) };
+          trainingJobs[id] = initialTrainingJob;
 
-        models[id] = newModel;
-      }
+          pubsub.publish(Event.BatchCompleted, {
+            batchCompleted: initialTrainingJob
+          });
 
-      const socket = new WebSocket(
-        process.env.BACKEND_ADDRESS || 'ws://localhost:8000'
-      );
+          if (!hasUrl) {
+            const urls = model.urls.concat(url);
 
-      socket.onmessage = message => {
-        const response = JSON.parse(message.data as string);
-        let trainingJob: TrainingJob;
+            return client
+              .query('UPDATE models set urls = $2 where id = $1 RETURNING *', [
+                id,
+                urls
+              ])
+              .then(results => results.rows[0]);
+          }
 
-        if (response.status == Status.Done) {
-          socket.close();
-          trainingJob = { id, status: JobStatus.DONE };
-        } else {
-          trainingJob = { ...response.results, id, status: JobStatus.ACTIVE };
-        }
+          return model;
+        })
+        .then(model => {
+          const socket = new WebSocket(
+            process.env.BACKEND_ADDRESS || 'ws://localhost:8000'
+          );
 
-        trainingJobs[id] = trainingJob;
+          socket.onmessage = message => {
+            const response = JSON.parse(message.data as string);
+            let trainingJob: TrainingJob;
 
-        pubsub.publish(Event.BatchCompleted, {
-          batchCompleted: trainingJob
+            if (response.status == Status.Done) {
+              socket.close();
+              trainingJob = { id, status: JobStatus.DONE };
+            } else {
+              trainingJob = {
+                ...response.results,
+                id,
+                status: JobStatus.ACTIVE
+              };
+            }
+
+            trainingJobs[id] = trainingJob;
+
+            pubsub.publish(Event.BatchCompleted, {
+              batchCompleted: trainingJob
+            });
+          };
+
+          socket.onopen = () => {
+            socket.send(
+              JSON.stringify({
+                args: { epochs, model, selectors, url },
+                key: MessageKey.Train
+              })
+            );
+          };
+
+          return initialTrainingJob;
         });
-      };
-
-      socket.onopen = () => {
-        socket.send(
-          JSON.stringify({
-            args: { epochs, model, selectors, url },
-            key: MessageKey.Train
-          })
-        );
-      };
-
-      return trainingJob;
     },
     updateModel: (_, args) => {
       if (!args) {
@@ -177,17 +194,25 @@ export const modelResolvers: Resolvers = {
       }
 
       const { id, name } = args.input;
-      const model = { ...models[id], name };
 
-      models[id] = model;
-
-      return model;
+      return client
+        .query('UPDATE models set name = $2 where id = $1 RETURNING *', [
+          id,
+          name
+        ])
+        .then(results => results.rows[0]);
     }
   },
   Query: {
     generateJob: (_, args) => (args ? generateJobs[args.input.id] : null),
-    model: (_, args) => (args ? models[args.input.id] : null),
-    models: () => Object.keys(models).map(key => models[key]),
+    model: (_, args) =>
+      args
+        ? client
+            .query('SELECT * FROM models WHERE id = $1', [args.input.id])
+            .then(results => results.rows[0])
+        : null,
+    models: () =>
+      client.query('SELECT * FROM models').then(results => results.rows),
     trainingJob: (_, args) => (args ? trainingJobs[args.input.id] : null)
   },
   Subscription: {
