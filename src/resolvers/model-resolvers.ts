@@ -64,6 +64,113 @@ export const modelResolvers: Resolvers = {
         };
       });
     },
+    generateTextFromModel: (_, args) => {
+      if (!args || !models[args.input.id]) {
+        return null;
+      }
+
+      const { count, id, maxLength, prefix, temperature } = args.input;
+      const generateJob = { id, status: JobStatus.PENDING, text: [] };
+      const model = models[id];
+      const text: string[] = [];
+
+      generateJobs[id] = generateJob;
+
+      pubsub.publish(Event.TextGenerated, {
+        textGenerated: generateJob
+      });
+
+      const socket = new WebSocket(
+        process.env.BACKEND_ADDRESS || 'ws://localhost:8000'
+      );
+
+      socket.onmessage = message => {
+        const response = JSON.parse(message.data as string);
+        let generateJob: GenerateJob;
+
+        if (response.status == Status.Done) {
+          socket.close();
+          generateJob = { id, status: JobStatus.DONE, text };
+        } else {
+          text.push(response.results);
+          generateJob = { id, status: JobStatus.ACTIVE, text };
+        }
+
+        generateJobs[id] = generateJob;
+
+        pubsub.publish(Event.TextGenerated, {
+          textGenerated: generateJob
+        });
+      };
+
+      socket.onopen = () => {
+        socket.send(
+          JSON.stringify({
+            args: { count, maxLength, model, prefix, temperature },
+            key: MessageKey.Generate
+          })
+        );
+      };
+
+      return generateJob;
+    },
+    trainModel: (_, args) => {
+      const hasUrl =
+        args && models[args.input.id].urls.indexOf(args.input.url) >= 0;
+
+      if (!args || !models[args.input.id] || (!args.input.force && hasUrl)) {
+        return null;
+      }
+
+      const { epochs, id, selectors, url } = args.input;
+      const model = models[id];
+      const trainingJob = { id, status: JobStatus.PENDING };
+
+      trainingJobs[id] = trainingJob;
+
+      pubsub.publish(Event.BatchCompleted, {
+        batchCompleted: trainingJob
+      });
+
+      if (!hasUrl) {
+        const newModel = { ...model, urls: model.urls.concat(url) };
+
+        models[id] = newModel;
+      }
+
+      const socket = new WebSocket(
+        process.env.BACKEND_ADDRESS || 'ws://localhost:8000'
+      );
+
+      socket.onmessage = message => {
+        const response = JSON.parse(message.data as string);
+        let trainingJob: TrainingJob;
+
+        if (response.status == Status.Done) {
+          socket.close();
+          trainingJob = { id, status: JobStatus.DONE };
+        } else {
+          trainingJob = { ...response.results, id, status: JobStatus.ACTIVE };
+        }
+
+        trainingJobs[id] = trainingJob;
+
+        pubsub.publish(Event.BatchCompleted, {
+          batchCompleted: trainingJob
+        });
+      };
+
+      socket.onopen = () => {
+        socket.send(
+          JSON.stringify({
+            args: { epochs, model, selectors, url },
+            key: MessageKey.Train
+          })
+        );
+      };
+
+      return trainingJob;
+    },
     updateModel: (_, args) => {
       if (!args) {
         return null;
@@ -84,125 +191,11 @@ export const modelResolvers: Resolvers = {
     trainingJob: (_, args) => (args ? trainingJobs[args.input.id] : null)
   },
   Subscription: {
-    generateTextFromModel: {
-      subscribe: (_, args) => {
-        const iterator = pubsub.asyncIterator<GenerateJob | null>(
-          Event.TextGenerated
-        );
-
-        if (!args || !models[args.input.id]) {
-          pubsub.publish(Event.TextGenerated, {
-            generateTextFromModel: null
-          });
-
-          return iterator;
-        }
-
-        const { count, id, maxLength, prefix, temperature } = args.input;
-        const model = models[id];
-        const text: string[] = [];
-
-        const socket = new WebSocket(
-          process.env.BACKEND_ADDRESS || 'ws://localhost:8000'
-        );
-
-        socket.onmessage = message => {
-          const response = JSON.parse(message.data as string);
-          let generateJob: GenerateJob;
-
-          if (response.status == Status.Done) {
-            socket.close();
-            generateJob = { id, status: JobStatus.DONE, text };
-          } else {
-            text.push(response.results);
-            generateJob = { id, status: JobStatus.ACTIVE, text };
-          }
-
-          generateJobs[id] = generateJob;
-
-          pubsub.publish(Event.TextGenerated, {
-            generateTextFromModel: generateJob
-          });
-        };
-
-        socket.onopen = () => {
-          socket.send(
-            JSON.stringify({
-              args: { count, maxLength, model, prefix, temperature },
-              key: MessageKey.Generate
-            })
-          );
-        };
-
-        pubsub.publish(Event.TextGenerated, {
-          generateTextFromModel: { id, status: JobStatus.PENDING, text }
-        });
-
-        return iterator;
-      }
+    batchCompleted: {
+      subscribe: () => pubsub.asyncIterator<TrainingJob>(Event.BatchCompleted)
     },
-    trainModel: {
-      subscribe: (_, args) => {
-        const iterator = pubsub.asyncIterator<TrainingJob | null>(
-          Event.BatchCompleted
-        );
-        const hasUrl =
-          args && models[args.input.id].urls.indexOf(args.input.url) >= 0;
-
-        if (!args || !models[args.input.id] || (!args.input.force && hasUrl)) {
-          pubsub.publish(Event.BatchCompleted, {
-            trainModel: null
-          });
-
-          return iterator;
-        }
-
-        const { epochs, id, selectors, url } = args.input;
-        const model = models[id];
-
-        if (!hasUrl) {
-          const newModel = { ...model, urls: model.urls.concat(url) };
-
-          models[id] = newModel;
-        }
-
-        const socket = new WebSocket(
-          process.env.BACKEND_ADDRESS || 'ws://localhost:8000'
-        );
-
-        socket.onmessage = message => {
-          const response = JSON.parse(message.data as string);
-          let trainingJob: TrainingJob;
-
-          if (response.status == Status.Done) {
-            socket.close();
-            trainingJob = { id, status: JobStatus.DONE };
-          } else {
-            trainingJob = { ...response.results, id, status: JobStatus.ACTIVE };
-          }
-
-          trainingJobs[id] = trainingJob;
-
-          pubsub.publish(Event.BatchCompleted, {
-            trainModel: trainingJob
-          });
-        };
-
-        socket.onopen = () => {
-          socket.send(
-            JSON.stringify({
-              args: { epochs, model, selectors, url },
-              key: MessageKey.Train
-            })
-          );
-        };
-
-        pubsub.publish(Event.TextGenerated, {
-          trainModel: { id, status: JobStatus.PENDING }
-        });
-
-        return iterator;
-      }
+    textGenerated: {
+      subscribe: () => pubsub.asyncIterator<GenerateJob>(Event.TextGenerated)
     }
   }
 };
