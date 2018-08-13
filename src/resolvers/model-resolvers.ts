@@ -1,6 +1,6 @@
-import { GenerateJob, JobStatus, Model, TrainingJob } from 'fun-with-ml-schema';
+import { GenerateJob, JobStatus, TrainingJob } from 'fun-with-ml-schema';
 import WebSocket from 'ws';
-import { MessageKey, Status } from '../backend';
+import { BACKEND_URI, MessageKey, Status } from '../backend';
 import client from '../db';
 import { Event, pubsub } from '../pubsub';
 import { Resolvers } from './resolvers';
@@ -29,9 +29,7 @@ export const modelResolvers: Resolvers = {
       const { id } = args.input;
 
       return new Promise(resolve => {
-        const socket = new WebSocket(
-          process.env.BACKEND_ADDRESS || 'ws://localhost:8000'
-        );
+        const socket = new WebSocket(BACKEND_URI);
 
         socket.onmessage = () => {
           socket.close();
@@ -68,7 +66,12 @@ export const modelResolvers: Resolvers = {
             return null;
           }
 
-          const generateJob = { id, status: JobStatus.PENDING, text: [] };
+          const generateJob = {
+            id,
+            errors: [],
+            status: JobStatus.PENDING,
+            text: []
+          };
           const text: string[] = [];
 
           generateJobs[id] = generateJob;
@@ -77,9 +80,7 @@ export const modelResolvers: Resolvers = {
             textGenerated: generateJob
           });
 
-          const socket = new WebSocket(
-            process.env.BACKEND_ADDRESS || 'ws://localhost:8000'
-          );
+          const socket = new WebSocket(BACKEND_URI);
 
           socket.onmessage = message => {
             const response = JSON.parse(message.data as string);
@@ -87,10 +88,17 @@ export const modelResolvers: Resolvers = {
 
             if (response.status == Status.Done) {
               socket.close();
-              generateJob = { id, status: JobStatus.DONE, text };
+              generateJob = { id, errors: [], status: JobStatus.DONE, text };
+            } else if (response.status == Status.Error) {
+              generateJob = {
+                id,
+                errors: [response.results],
+                status: JobStatus.ERROR,
+                text: []
+              };
             } else {
               text.push(response.results);
-              generateJob = { id, status: JobStatus.ACTIVE, text };
+              generateJob = { id, errors: [], status: JobStatus.ACTIVE, text };
             }
 
             generateJobs[id] = generateJob;
@@ -118,7 +126,7 @@ export const modelResolvers: Resolvers = {
       }
 
       const { epochs, force, id, selectors, url } = args.input;
-      const initialTrainingJob = { id, status: JobStatus.PENDING };
+      const initialTrainingJob = { id, errors: [], status: JobStatus.PENDING };
 
       return client
         .query('SELECT * from models WHERE id = $1', [id])
@@ -150,9 +158,7 @@ export const modelResolvers: Resolvers = {
           return model;
         })
         .then(model => {
-          const socket = new WebSocket(
-            process.env.BACKEND_ADDRESS || 'ws://localhost:8000'
-          );
+          const socket = new WebSocket(BACKEND_URI);
 
           socket.onmessage = message => {
             const response = JSON.parse(message.data as string);
@@ -160,10 +166,17 @@ export const modelResolvers: Resolvers = {
 
             if (response.status == Status.Done) {
               socket.close();
-              trainingJob = { id, status: JobStatus.DONE };
+              trainingJob = { id, errors: [], status: JobStatus.DONE };
+            } else if (response.status == Status.Error) {
+              trainingJob = {
+                errors: [response.results],
+                id,
+                status: JobStatus.ERROR
+              };
             } else {
               trainingJob = {
                 ...response.results,
+                errors: [],
                 id,
                 status: JobStatus.ACTIVE
               };

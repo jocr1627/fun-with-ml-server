@@ -6,5 +6,6 @@ export enum MessageKey {
 
 export enum Status {
   Done = 0,
-  Active = 1
+  Active = 1,
+  Error = 2
 }

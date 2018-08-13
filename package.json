@@ -12,7 +12,7 @@
   "license": "ISC",
   "dependencies": {
     "apollo-server": "^2.0.0",
-    "fun-with-ml-schema": "^1.0.0",
+    "fun-with-ml-schema": "^1.1.0",
     "graphql": "^0.13.2",
     "pg": "^7.4.3"
   },
